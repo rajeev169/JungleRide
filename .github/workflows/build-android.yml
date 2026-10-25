@@ -1,0 +1,80 @@
+name: Build JungleRide Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'Assets/**'
+      - 'Packages/**'
+      - 'ProjectSettings/**'
+      - '.github/workflows/build-android.yml'
+      - 'README.md'
+
+concurrency:
+  group: jungleride-android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Unity Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: false
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Cache Unity Library
+        uses: actions/cache@v4
+        with:
+          path: Library
+          key: Library-Android-${{ hashFiles('Packages/manifest.json', 'ProjectSettings/ProjectVersion.txt', 'Assets/**/*.cs') }}
+          restore-keys: |
+            Library-Android-
+
+      - name: Build Android APK
+        uses: game-ci/unity-builder@v4
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        with:
+          projectPath: .
+          unityVersion: 2022.3.62f1
+          targetPlatform: Android
+          buildMethod: JungleBuild.BuildAndroid
+          buildName: JungleRide
+          versioning: None
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: JungleRide-APK-${{ github.run_number }}
+          path: build/Android/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Unity build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: JungleRide-build-logs-${{ github.run_number }}
+          path: |
+            /home/runner/.cache/unity3d/**
+            /home/runner/work/**/build/**/*.log
+          if-no-files-found: ignore
+          retention-days: 7
