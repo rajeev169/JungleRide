@@ -1,0 +1,338 @@
+name: Build Android APK from uploaded Unity ZIP
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_zip:
+        description: "Optional ZIP path in the repository (leave blank to auto-detect)"
+        required: false
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - "*.zip"
+      - ".github/workflows/build-android.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unity-zip-android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Detect, extract, and build selected Unity project
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: false
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect project ZIP
+        id: detect
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_ZIP: ${{ inputs.project_zip }}
+          BEFORE_SHA: ${{ github.event.before }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${INPUT_ZIP}" ]]; then
+            selected="${INPUT_ZIP}"
+          elif [[ "${EVENT_NAME}" == "push" && -n "${BEFORE_SHA}" && "${BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]]; then
+            mapfile -t changed < <(git diff --name-only "${BEFORE_SHA}" "${CURRENT_SHA}" -- '*.zip' | grep -E '^[^/]+\.zip$' || true)
+            if [[ "${#changed[@]}" -eq 1 ]]; then
+              selected="${changed[0]}"
+            elif [[ "${#changed[@]}" -gt 1 ]]; then
+              echo "::error::More than one root ZIP changed in this push. Upload one project ZIP per commit, or run the workflow manually and select project_zip."
+              printf 'Changed ZIPs: %s\n' "${changed[*]}"
+              exit 1
+            else
+              selected=""
+            fi
+          else
+            selected=""
+          fi
+
+          if [[ -z "${selected}" ]]; then
+            mapfile -t root_zips < <(find . -maxdepth 1 -type f -iname '*.zip' -printf '%f\n' | sort)
+            if [[ "${#root_zips[@]}" -eq 1 ]]; then
+              selected="${root_zips[0]}"
+            elif [[ "${#root_zips[@]}" -eq 0 ]]; then
+              echo "::error::No ZIP file found in the repository root."
+              exit 1
+            else
+              echo "::error::Multiple ZIP files found. Upload/change only one ZIP per commit, or run Actions manually and set project_zip to the exact root filename."
+              printf 'Root ZIPs: %s\n' "${root_zips[*]}"
+              exit 1
+            fi
+          fi
+
+          if [[ "${selected}" == */* || ! -f "${selected}" || "${selected,,}" != *.zip ]]; then
+            echo "::error::project_zip must be the exact filename of a ZIP in the repository root."
+            exit 1
+          fi
+
+          echo "zip_path=${selected}" >> "$GITHUB_OUTPUT"
+          echo "Selected source ZIP: ${selected}"
+
+      - name: Safely extract ZIP and prepare Unity project
+        id: prepare
+        shell: bash
+        env:
+          ZIP_PATH: ${{ steps.detect.outputs.zip_path }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, pathlib, shutil, zipfile
+
+          zip_path = pathlib.Path(os.environ["ZIP_PATH"])
+          destination = pathlib.Path(os.environ["RUNNER_TEMP"]) / "unity-zip-extracted"
+          if destination.exists():
+              shutil.rmtree(destination)
+          destination.mkdir(parents=True)
+
+          with zipfile.ZipFile(zip_path) as archive:
+              for info in archive.infolist():
+                  name = info.filename.replace("\\", "/")
+                  parts = pathlib.PurePosixPath(name).parts
+                  if name.startswith("/") or ".." in parts:
+                      raise SystemExit(f"Unsafe path in ZIP: {name}")
+              archive.extractall(destination)
+
+          # Find one project root: a directory that directly contains Assets/.
+          candidates = []
+          for assets in destination.rglob("Assets"):
+              if assets.is_dir() and (assets.parent / "Assets").resolve() == assets.resolve():
+                  candidates.append(assets.parent)
+          # Keep only candidates with Assets and C# scripts; ignore nested asset folders.
+          candidates = [
+              p for p in candidates
+              if (p / "Assets").is_dir()
+              and any((p / "Assets").rglob("*.cs"))
+          ]
+          # Remove nested candidates if an outer project root already contains them.
+          candidates = [
+              p for p in candidates
+              if not any(other != p and other in p.parents for other in candidates)
+          ]
+          if len(candidates) != 1:
+              raise SystemExit(
+                  "Could not identify exactly one Unity source root in the ZIP. "
+                  f"Found: {[str(p.relative_to(destination)) for p in candidates]}"
+              )
+          source = candidates[0]
+          assets = source / "Assets"
+
+          # This workflow supports these two source packs, which are not full Unity projects.
+          if (assets / "Editor" / "OffroadSceneBuilder.cs").is_file():
+              project_name = "OffroadCycling"
+          elif (assets / "Scripts" / "GameBootstrap.cs").is_file():
+              project_name = "DownhillRush"
+          else:
+              raise SystemExit(
+                  "Unsupported ZIP. Expected OffroadCycling (OffroadSceneBuilder.cs) "
+                  "or DownhillRush (GameBootstrap.cs)."
+              )
+
+          # Remove any old project content checked into the repository so it cannot leak
+          # into this build, then copy only the selected ZIP's project files.
+          repo = pathlib.Path.cwd()
+          for name in ("Assets", "Packages", "ProjectSettings"):
+              target = repo / name
+              if target.exists():
+                  shutil.rmtree(target)
+
+          shutil.copytree(assets, repo / "Assets")
+          for name in ("Packages", "ProjectSettings"):
+              optional = source / name
+              if optional.is_dir():
+                  shutil.copytree(optional, repo / name)
+
+          # These two source packs are starter packs, not complete Unity projects.
+          (repo / "Packages").mkdir(parents=True, exist_ok=True)
+          manifest = repo / "Packages" / "manifest.json"
+          if not manifest.exists():
+              mods = ["com.unity.ugui"] + [
+                  "com.unity.modules." + m for m in (
+                      "ai", "androidjni", "animation", "audio", "imgui", "jsonserialize",
+                      "particlesystem", "physics", "physics2d", "ui", "uielements",
+                      "unitywebrequest"
+                  )
+              ]
+              manifest.write_text(
+                  '{\n  "dependencies": {\n' +
+                  ",\n".join('    "%s": "1.0.0"' % m for m in mods) +
+                  '\n  }\n}\n',
+                  encoding="utf-8"
+              )
+
+          (repo / "ProjectSettings").mkdir(parents=True, exist_ok=True)
+          version_file = repo / "ProjectSettings" / "ProjectVersion.txt"
+          if not version_file.exists():
+              version_file.write_text(
+                  "m_EditorVersion: 2022.3.62f1\n",
+                  encoding="utf-8"
+              )
+
+          print(f"Prepared project: {project_name}")
+          print(f"Source root: {source.relative_to(destination)}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"project_name={project_name}\n")
+          PY
+
+      - name: Create project-specific Android build entry point
+        shell: bash
+        env:
+          PROJECT_NAME: ${{ steps.prepare.outputs.project_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p Assets/Editor
+          cat > Assets/Editor/ZipProjectBuild.cs <<'CS'
+          using System;
+          using System.IO;
+          using System.Reflection;
+          using UnityEditor;
+          using UnityEditor.Build.Reporting;
+          using UnityEditor.SceneManagement;
+          using UnityEngine;
+          using UnityEngine.SceneManagement;
+
+          public static class ZipProjectBuild
+          {
+              public static void BuildAndroid()
+              {
+                  string projectName;
+                  string scenePath;
+
+                  if (File.Exists("Assets/Editor/OffroadSceneBuilder.cs"))
+                  {
+                      projectName = "OffroadCycling";
+                      scenePath = "Assets/Scenes/OffroadTrail.unity";
+
+                      // Call the project's own editor scene builder.
+                      Type builder = Type.GetType(
+                          "OffroadCycling.EditorTools.OffroadSceneBuilder, Assembly-CSharp-Editor");
+                      if (builder == null)
+                          throw new Exception("Could not locate OffroadSceneBuilder in the Editor assembly.");
+
+                      MethodInfo method = builder.GetMethod(
+                          "Build", BindingFlags.Public | BindingFlags.Static);
+                      if (method == null)
+                          throw new Exception("OffroadSceneBuilder.Build() was not found.");
+
+                      method.Invoke(null, null);
+                      AssetDatabase.Refresh();
+
+                      if (!File.Exists(scenePath))
+                          throw new Exception("Offroad scene builder did not create " + scenePath);
+                  }
+                  else if (File.Exists("Assets/Scripts/GameBootstrap.cs"))
+                  {
+                      projectName = "DownhillRush";
+                      scenePath = "Assets/Scenes/DownhillRush.unity";
+                      Directory.CreateDirectory("Assets/Scenes");
+
+                      // GameBootstrap builds the game after any scene loads.
+                      Scene scene = EditorSceneManager.NewScene(
+                          NewSceneSetup.EmptyScene, NewSceneMode.Single);
+                      if (!EditorSceneManager.SaveScene(scene, scenePath))
+                          throw new Exception("Could not save DownhillRush startup scene.");
+                      AssetDatabase.Refresh();
+                  }
+                  else
+                  {
+                      throw new Exception("Unsupported source ZIP: no known game entry point found.");
+                  }
+
+                  EditorBuildSettings.scenes = new[]
+                  {
+                      new EditorBuildSettingsScene(scenePath, true)
+                  };
+
+                  PlayerSettings.productName = projectName;
+                  PlayerSettings.applicationIdentifier =
+                      projectName == "OffroadCycling"
+                          ? "com.appforge.offroadcycling"
+                          : "com.appforge.downhillrush";
+                  PlayerSettings.defaultInterfaceOrientation = UIOrientation.LandscapeLeft;
+                  int minutes = (int)(DateTime.UtcNow - new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalMinutes;
+                  PlayerSettings.Android.bundleVersionCode = minutes;
+                  PlayerSettings.bundleVersion = "1.0." + minutes;
+                  PlayerSettings.SetScriptingBackend(
+                      BuildTargetGroup.Android, ScriptingImplementation.IL2CPP);
+                  PlayerSettings.Android.targetArchitectures = AndroidArchitecture.ARM64;
+
+                  EditorUserBuildSettings.SwitchActiveBuildTarget(
+                      BuildTargetGroup.Android, BuildTarget.Android);
+
+                  string output = Path.GetFullPath("build/Android/" + projectName + ".apk");
+                  Directory.CreateDirectory(Path.GetDirectoryName(output));
+
+                  var options = new BuildPlayerOptions
+                  {
+                      scenes = new[] { scenePath },
+                      locationPathName = output,
+                      target = BuildTarget.Android,
+                      options = BuildOptions.None
+                  };
+
+                  BuildReport report = BuildPipeline.BuildPlayer(options);
+                  if (report.summary.result != BuildResult.Succeeded)
+                      throw new Exception(
+                          "Android build failed: " + report.summary.result +
+                          "; errors=" + report.summary.totalErrors);
+
+                  Debug.Log("ZIP project build succeeded: " + output);
+              }
+          }
+          CS
+
+      - name: Build Android APK
+        uses: game-ci/unity-builder@v4
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        with:
+          projectPath: .
+          unityVersion: 2022.3.62f1
+          targetPlatform: Android
+          buildMethod: ZipProjectBuild.BuildAndroid
+          versioning: None
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.prepare.outputs.project_name }}-APK-${{ github.run_number }}
+          path: build/Android/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Unity build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Unity-build-logs-${{ github.run_number }}
+          path: |
+            /home/runner/.cache/unity3d/**
+            /home/runner/work/**/build/**/*.log
+          if-no-files-found: ignore
+          retention-days: 7
