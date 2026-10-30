@@ -1,0 +1,310 @@
+name: Test ride on Android emulator
+
+# Manual only: Actions -> "Test ride on Android emulator" -> Run workflow.
+# Builds a test APK (also for PC-type processors), starts Android emulators and lets the game's
+# autopilot ride the chosen levels. Results (report + screenshots) are shown on the run page
+# and can be downloaded as "test-ride-..." artifacts.
+
+on:
+  workflow_dispatch:
+    inputs:
+      levels:
+        description: "Levels to test, e.g. 1-15 or 4,12,15"
+        required: false
+        default: "1-15"
+        type: string
+      project_zip:
+        description: "Optional ZIP file name in the repository (leave blank if there is only one)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: emulator-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build test APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      groups: ${{ steps.groups.outputs.groups }}
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: false
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Split levels into groups (one emulator per group)
+        id: groups
+        shell: bash
+        env:
+          LEVELS: ${{ inputs.levels }}
+        run: |
+          python3 - <<'PY'
+          import os, json
+          s = (os.environ.get("LEVELS") or "1-15").strip().lower()
+          if s == "all": s = "1-15"
+          levels = []
+          for part in s.split(","):
+              part = part.strip()
+              if "-" in part:
+                  a, b = part.split("-", 1)
+                  levels += list(range(int(a), int(b) + 1))
+              elif part:
+                  levels.append(int(part))
+          levels = [l for l in dict.fromkeys(levels) if 1 <= l <= 15]
+          if not levels:
+              raise SystemExit("No valid levels in: " + s)
+          groups = [",".join(str(l) for l in levels[i:i + 3]) for i in range(0, len(levels), 3)]
+          print("Groups:", groups)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write("groups=" + json.dumps(groups) + "\n")
+          PY
+
+      - name: Find project ZIP
+        id: detect
+        shell: bash
+        env:
+          INPUT_ZIP: ${{ inputs.project_zip }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${INPUT_ZIP}" ]]; then
+            selected="${INPUT_ZIP}"
+          else
+            mapfile -t root_zips < <(find . -maxdepth 1 -type f -iname '*.zip' -printf '%f\n' | sort)
+            if [[ "${#root_zips[@]}" -ne 1 ]]; then
+              echo "::error::Expected exactly one ZIP in the repository root (found ${#root_zips[@]}). Set project_zip."
+              exit 1
+            fi
+            selected="${root_zips[0]}"
+          fi
+          [[ -f "${selected}" ]] || { echo "::error::ZIP not found: ${selected}"; exit 1; }
+          echo "zip_path=${selected}" >> "$GITHUB_OUTPUT"
+          echo "Selected: ${selected}"
+
+      - name: Extract ZIP into a Unity project
+        shell: bash
+        env:
+          ZIP_PATH: ${{ steps.detect.outputs.zip_path }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, pathlib, shutil, zipfile
+          zip_path = pathlib.Path(os.environ["ZIP_PATH"])
+          dest = pathlib.Path(os.environ["RUNNER_TEMP"]) / "unity-zip-extracted"
+          if dest.exists(): shutil.rmtree(dest)
+          dest.mkdir(parents=True)
+          with zipfile.ZipFile(zip_path) as z:
+              for info in z.infolist():
+                  name = info.filename.replace("\\", "/")
+                  if name.startswith("/") or ".." in pathlib.PurePosixPath(name).parts:
+                      raise SystemExit("Unsafe path in ZIP: " + name)
+              z.extractall(dest)
+          roots = [a.parent for a in dest.rglob("Assets") if a.is_dir() and (a / "Scripts" / "GameBootstrap.cs").is_file()]
+          if len(roots) != 1:
+              raise SystemExit("Could not find exactly one Jungle Rider project (Assets/Scripts/GameBootstrap.cs) in the ZIP")
+          src = roots[0]
+          repo = pathlib.Path.cwd()
+          for name in ("Assets", "Packages", "ProjectSettings"):
+              if (repo / name).exists(): shutil.rmtree(repo / name)
+          shutil.copytree(src / "Assets", repo / "Assets")
+          for name in ("Packages", "ProjectSettings"):
+              if (src / name).is_dir(): shutil.copytree(src / name, repo / name)
+          (repo / "ProjectSettings").mkdir(parents=True, exist_ok=True)
+          v = repo / "ProjectSettings" / "ProjectVersion.txt"
+          if not v.exists(): v.write_text("m_EditorVersion: 2022.3.62f1\n", encoding="utf-8")
+          print("Prepared from", src)
+          PY
+
+      - name: Create test build entry point
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p Assets/Editor
+          cat > Assets/Editor/ZipProjectTestBuild.cs <<'CS'
+          using System;
+          using System.IO;
+          using UnityEditor;
+          using UnityEditor.Build.Reporting;
+          using UnityEditor.SceneManagement;
+          using UnityEngine;
+          using UnityEngine.Rendering;
+          using UnityEngine.SceneManagement;
+
+          public static class ZipProjectTestBuild
+          {
+              public static void BuildAndroidTest()
+              {
+                  const string scenePath = "Assets/Scenes/DownhillRush.unity";
+                  Directory.CreateDirectory("Assets/Scenes");
+                  Scene scene = EditorSceneManager.NewScene(NewSceneSetup.EmptyScene, NewSceneMode.Single);
+                  if (!EditorSceneManager.SaveScene(scene, scenePath))
+                      throw new Exception("Could not save the start scene.");
+                  AssetDatabase.Refresh();
+                  EditorBuildSettings.scenes = new[] { new EditorBuildSettingsScene(scenePath, true) };
+
+                  PlayerSettings.productName = "DownhillRush";
+                  PlayerSettings.applicationIdentifier = "com.appforge.downhillrush";
+                  PlayerSettings.defaultInterfaceOrientation = UIOrientation.LandscapeLeft;
+                  PlayerSettings.SetScriptingBackend(BuildTargetGroup.Android, ScriptingImplementation.IL2CPP);
+                  // phones (ARM64) + the emulator (x86_64)
+                  PlayerSettings.Android.targetArchitectures = AndroidArchitecture.ARM64 | AndroidArchitecture.X86_64;
+                  // the emulator draws with OpenGL ES 3 (software), not Vulkan
+                  PlayerSettings.SetUseDefaultGraphicsAPIs(BuildTarget.Android, false);
+                  PlayerSettings.SetGraphicsAPIs(BuildTarget.Android, new[] { GraphicsDeviceType.OpenGLES3 });
+                  EditorUserBuildSettings.buildAppBundle = false;
+                  EditorUserBuildSettings.SwitchActiveBuildTarget(BuildTargetGroup.Android, BuildTarget.Android);
+
+                  string output = Path.GetFullPath("build/Android/DownhillRush-test.apk");
+                  Directory.CreateDirectory(Path.GetDirectoryName(output));
+                  BuildReport report = BuildPipeline.BuildPlayer(new BuildPlayerOptions
+                  {
+                      scenes = new[] { scenePath },
+                      locationPathName = output,
+                      target = BuildTarget.Android,
+                      options = BuildOptions.None
+                  });
+                  if (report.summary.result != BuildResult.Succeeded)
+                      throw new Exception("Test build failed: " + report.summary.result + "; errors=" + report.summary.totalErrors);
+                  Debug.Log("Test APK built: " + output);
+              }
+          }
+          CS
+
+      - name: Build test APK
+        uses: game-ci/unity-builder@v4
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        with:
+          projectPath: .
+          unityVersion: 2022.3.62f1
+          targetPlatform: Android
+          buildMethod: ZipProjectTestBuild.BuildAndroidTest
+          versioning: None
+
+      - name: Upload test APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-apk
+          path: build/Android/*.apk
+          if-no-files-found: error
+          retention-days: 3
+
+  ride:
+    name: Ride levels ${{ matrix.levels }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        levels: ${{ fromJSON(needs.build.outputs.groups) }}
+    steps:
+      - name: Enable KVM (fast emulator)
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Download test APK
+        uses: actions/download-artifact@v4
+        with:
+          name: test-apk
+          path: apk
+
+      - name: Write the test script
+        shell: bash
+        env:
+          LEVELS: ${{ matrix.levels }}
+        run: |
+          mkdir -p results logs
+          cat > ride.sh <<'SH'
+          #!/bin/bash
+          PKG=com.appforge.downhillrush
+          DIR=/sdcard/Android/data/$PKG/files/autotest
+          adb wait-for-device
+          adb root || true
+          sleep 3
+          adb wait-for-device
+          adb shell settings put system screen_off_timeout 2147483647 || true
+          adb shell svc power stayon true || true
+          APK=$(ls apk/*.apk | head -1)
+          echo "Installing $APK"
+          adb install -r -g "$APK" || { echo "INSTALL FAILED" > results/report.txt; exit 0; }
+          adb logcat -c
+          (adb logcat -v time Unity:V AndroidRuntime:E DEBUG:V libc:F '*:S' > logs/logcat.txt 2>&1 &)
+          echo "Starting test ride for levels: $LEVELS"
+          adb shell am start -W -n $PKG/com.unity3d.player.UnityPlayerActivity -e autotest "$LEVELS"
+          START=$SECONDS
+          N=0
+          while [ $((SECONDS-START)) -lt 9000 ]; do
+            sleep 30
+            if adb shell "test -f $DIR/done.txt && echo yes" | grep -q yes; then echo "Test ride finished"; break; fi
+            if ! adb shell pidof $PKG > /dev/null; then echo "THE GAME CLOSED (crash?)"; echo "GAME CLOSED during the test (see logcat)" > results/game_closed.txt; break; fi
+            N=$((N+1))
+            if [ $((N % 10)) -eq 0 ]; then
+              adb exec-out screencap -p > "results/live_$(printf '%03d' $N).png" || true
+              adb shell "cat $DIR/report.txt" | tail -4 || true
+            fi
+          done
+          adb exec-out screencap -p > results/last_screen.png || true
+          adb pull "$DIR" results/ || true
+          echo "Pulled results:"; ls -R results | head -80
+          exit 0
+          SH
+          chmod +x ride.sh
+          echo "LEVELS=$LEVELS" >> "$GITHUB_ENV"
+
+      - name: Run emulator and ride
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          arch: x86_64
+          target: google_apis
+          profile: pixel_4
+          ram-size: 4096M
+          disk-size: 4096M
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none
+          disable-animations: true
+          script: ./ride.sh
+
+      - name: Show report on the run page
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Test ride: levels ${LEVELS}"
+            echo '```'
+            if [ -f results/autotest/report.txt ]; then cat results/autotest/report.txt;
+            elif [ -f results/report.txt ]; then cat results/report.txt;
+            else echo "No report (the game may not have started). Check logcat in the artifact."; fi
+            [ -f results/game_closed.txt ] && cat results/game_closed.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Unity errors in logcat:"; grep -iE "exception|error" logs/logcat.txt | head -40 || true
+
+      - name: Upload screenshots, report and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-ride-levels-${{ strategy.job-index }}
+          path: |
+            results/
+            logs/
+          if-no-files-found: warn
+          retention-days: 7
